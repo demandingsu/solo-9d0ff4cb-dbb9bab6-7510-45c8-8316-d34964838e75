@@ -6,3 +6,4 @@ data/
 *.db
 demo_site/
 tests/
+demo_site_round2/

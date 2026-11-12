@@ -12,6 +12,7 @@ services:
     restart: unless-stopped
 
   # 本地分页 HTML 示例公告站（纯静态文件，nginx 托管）
+  # /round2/ 为“复采时详情已变化”的第二轮样例，用于验证追溯证据随轮次切换
   demo-site:
     image: nginx:1.27-alpine
     container_name: tender-demo-site
@@ -19,6 +20,7 @@ services:
       - "8001:80"
     volumes:
       - ./demo_site:/usr/share/nginx/html:ro
+      - ./demo_site_round2:/usr/share/nginx/html/round2:ro
     restart: unless-stopped
 
 volumes:

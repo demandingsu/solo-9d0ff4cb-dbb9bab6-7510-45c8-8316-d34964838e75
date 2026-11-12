@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 
 class MergeError(ValueError):
@@ -25,8 +25,20 @@ class EffectiveDeadline:
     source_url: str
 
 
-def _sort_key(row: dict[str, Any]) -> tuple[str, str]:
+def sort_key(row: dict[str, Any]) -> tuple[str, str]:
+    """项目内公告的确定性次序：先按发布时间，再按公告编号。"""
     return (row["published_at"] or "", row["code"] or "")
+
+
+def order_group(group: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一项目的公告按发布时间（升序）排列，供生效判定与追溯共用。"""
+    return sorted(group, key=sort_key)
+
+
+def effective_source(ordered_group: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """在已按发布时间排序的组内，取最新一份声明了截止时间的公告；
+    最新公告未声明截止时间时自然沿用上一份带截止时间的公告。"""
+    return next((r for r in reversed(ordered_group) if r.get("deadline")), None)
 
 
 def merge_projects(rows: Iterable[dict[str, Any]]) -> list[EffectiveDeadline]:
@@ -63,8 +75,7 @@ def merge_projects(rows: Iterable[dict[str, Any]]) -> list[EffectiveDeadline]:
     for code, group in groups.items():
         project_name = originals[code]["project_name"]
         # 按发布时间升序；最新发布的公告优先决定截止时间
-        ordered = sorted(group, key=_sort_key)
-        source = next((r for r in reversed(ordered) if r.get("deadline")), None)
+        source = effective_source(order_group(group))
         if source is None:
             raise MergeError(f"项目 {project_name} 的所有公告均未给出投标截止时间")
         results.append(

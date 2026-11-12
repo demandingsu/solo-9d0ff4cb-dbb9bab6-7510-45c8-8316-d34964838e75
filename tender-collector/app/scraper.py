@@ -3,13 +3,15 @@
 流程：
 1. 从用户提交的列表页开始，沿分页链接抓取全部列表页（去重、防环、限量）；
 2. 收集列表页中全部详情页链接（同源、去重）；
-3. 逐页抓取详情并解析为结构化公告。
+3. 逐页抓取详情并解析为结构化公告，同时提取追溯证据：
+   详情 HTML 原始字节的 SHA-256、投标截止时间原文及其所在表格行号。
 
 任一列表页或详情页读取失败（网络错误、非 2xx、HTML 缺关键字段）都抛出
 CollectionError，由上层整体放弃本次采集，数据库保留上次成功结果。
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -18,6 +20,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
+
+DEADLINE_FIELD = "投标截止时间"
 
 
 class CollectionError(Exception):
@@ -34,6 +38,9 @@ class ParsedAnnouncement:
     deadline: str | None
     corrects_code: str | None
     detail_url: str
+    # ---- 追溯证据（采集时与公告记录同一事务落库） ----
+    detail_sha256: str        # 详情 HTML 原始字节的 SHA-256
+    deadline_row: int | None  # “投标截止时间”字段所在表格行（1 起，无则 None）
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +52,8 @@ class ParsedAnnouncement:
             "deadline": self.deadline,
             "corrects_code": self.corrects_code,
             "detail_url": self.detail_url,
+            "detail_sha256": self.detail_sha256,
+            "deadline_row": self.deadline_row,
         }
 
 
@@ -53,14 +62,14 @@ def _same_origin(url: str, base: str) -> bool:
     return (u.scheme, u.netloc) == (b.scheme, b.netloc)
 
 
-def _get(client: httpx.Client, url: str) -> str:
+def _get(client: httpx.Client, url: str) -> httpx.Response:
     try:
         resp = client.get(url)
     except httpx.HTTPError as exc:
         raise CollectionError(f"读取页面失败 {url}: {exc}") from exc
     if resp.status_code // 100 != 2:
         raise CollectionError(f"读取页面失败 {url}: HTTP {resp.status_code}")
-    return resp.text
+    return resp
 
 
 def _parse_list(html_text: str, list_url: str) -> tuple[set[str], set[str]]:
@@ -91,7 +100,25 @@ def _field(soup: BeautifulSoup, label: str) -> str | None:
     return text or None
 
 
-def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
+def _deadline_evidence(soup: BeautifulSoup) -> tuple[str | None, int | None]:
+    """返回 (截止时间原文, 所在表格行号)。行号按 table.detail-table 内
+    <tr> 顺序从 1 数起；未找到该字段时两者均为 None。"""
+    table = soup.select_one("table.detail-table")
+    if table is None:
+        return None, None
+    for row_no, tr in enumerate(table.select("tr"), start=1):
+        th = tr.select_one(f'th[data-field="{DEADLINE_FIELD}"]')
+        if th is None:
+            continue
+        td = th.find_next_sibling("td")
+        text = td.get_text(strip=True) if td is not None else ""
+        return (text or None), row_no
+    return None, None
+
+
+def _parse_detail(
+    html_text: str, detail_url: str, detail_sha256: str
+) -> ParsedAnnouncement:
     soup = BeautifulSoup(html_text, "html.parser")
     article = soup.select_one("article.announcement-detail")
     if article is None:
@@ -105,7 +132,7 @@ def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
     title_el = soup.select_one("h1.detail-title")
     title = title_el.get_text(strip=True) if title_el else None
     project_name = _field(soup, "项目名称")
-    deadline = _field(soup, "投标截止时间")
+    deadline, deadline_row = _deadline_evidence(soup)
 
     kind = {"original": "original", "correction": "correction"}.get(kind_raw or "", "")
     if not kind:
@@ -136,6 +163,8 @@ def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
         deadline=deadline.strip() if deadline else None,
         corrects_code=corrects.strip() if corrects else None,
         detail_url=detail_url,
+        detail_sha256=detail_sha256,
+        deadline_row=deadline_row,
     )
 
 
@@ -160,7 +189,7 @@ def collect(list_url: str) -> list[dict[str, Any]]:
                 continue
             seen_pages.add(page_url)
 
-            html_text = _get(client, page_url)
+            html_text = _get(client, page_url).text
             details, more_pages = _parse_list(html_text, page_url)
             detail_urls.update(details)
             for u in more_pages:
@@ -170,7 +199,11 @@ def collect(list_url: str) -> list[dict[str, Any]]:
         # 2) 逐页抓取详情 —— 任一失败即整体失败
         announcements: list[dict[str, Any]] = []
         for detail_url in sorted(detail_urls):  # 排序仅为日志/测试的确定性
-            html_text = _get(client, detail_url)
-            announcements.append(_parse_detail(html_text, detail_url).as_dict())
+            resp = _get(client, detail_url)
+            # 证据哈希基于服务器返回的原始字节，与后续任何解码无关
+            sha256 = hashlib.sha256(resp.content).hexdigest()
+            announcements.append(
+                _parse_detail(resp.text, detail_url, sha256).as_dict()
+            )
 
     return announcements
